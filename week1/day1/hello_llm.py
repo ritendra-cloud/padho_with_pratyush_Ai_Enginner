@@ -1,31 +1,47 @@
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-from groq import Groq
+import json
+import urllib.error
+import urllib.request
 
-load_dotenv()
-my_api_key=os.getenv("GROQ_API_KEY")
 
-if not my_api_key:
-    raise ValueError("API key kaha hai bhai")
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL = "qwen2.5-coder:7b"
 
-client=Groq(api_key=my_api_key)
 
-model="llama-3.3-70b-versatile"
-role="user"
-prompt="Do you know Padho with Pratyush"
-# message me role and content
-message={
-    "role": role,
-    "content": prompt
-}
+def ask_ollama(prompt: str) -> str:
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "stream": False,
+    }
 
-messages=[message]
+    request = urllib.request.Request(
+        OLLAMA_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
 
-response=client.chat.completions.create(model=model, messages=messages)
-print(response)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            "Ollama is not reachable. Start it with `ollama serve` and try again."
+        ) from error
 
-print("#######################################")
+    return data["message"]["content"]
 
-answer=response.choices[0].message.content
+
+prompt = (
+    "Explain Python **kwargs. Return only 3 short numbered lines. "
+    "No markdown code block. Line 1: meaning. Line 2: why useful. "
+    "Line 3: tiny example."
+)
+answer = ask_ollama(prompt)
+
 print(answer)
