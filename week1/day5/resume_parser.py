@@ -1,18 +1,40 @@
-import os
+import json
 import time
+import urllib.error
+import urllib.request
+from textwrap import shorten
 from pathlib import Path
-from dotenv import load_dotenv
-from groq import Groq
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-load_dotenv()
-my_api_key=os.getenv("GROQ_API_KEY")
 
-if not my_api_key:
-    raise ValueError("API key kaha hai bhai")
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL = "qwen2.5-coder:7b"
 
-client=Groq(api_key=my_api_key)
-model = "openai/gpt-oss-120b"
+
+def ask_ollama(messages: list[dict[str, str]], schema: dict | None = None) -> str:
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+    if schema is not None:
+        payload["format"] = schema
+
+    request = urllib.request.Request(
+        OLLAMA_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.loads(response.read().decode("utf-8"))["message"]["content"]
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            "Ollama is not reachable. Start it with `ollama serve` and try again."
+        ) from error
 
 
 job_description="""
@@ -67,6 +89,7 @@ structured information from them.
 Return ONLY valid JSON matching this schema:
 
 {jobd_schema}
+
 IMPORTANT:
 Do NOT return the schema itself.
 Do NOT return fields like "properties", "title" or "type".
@@ -90,24 +113,15 @@ message_user={
     "role" : "user",
     "content" : user_prompt
 }
-response_format={
-    "type" : "json_object"
-}
-
-
 messages=[message_system, message_user]
 
-response=client.chat.completions.create(model=model, messages=messages, response_format=response_format)
-
-
-answer=response.choices[0].message.content
+answer = ask_ollama(messages, schema=jobd_schema)
 
 raw_json=answer
 # print(raw_json)
 
 
 
-import json
 job_data=json.loads(raw_json)
 
 job = JobD(**job_data)
@@ -159,14 +173,14 @@ def final_score(job,resume):
 
     {match_schema}
 
-    Give me:
+    Put these exact keys inside the details object:
 
-    1. Candidate name
-    2. Matching skills
-    3. Missing important skills
-    4. Whether experience requirement is met
-    5. Overall match percentage from 0 to 100
-    6. A short final verdict
+    1. candidate_name
+    2. matching_skills
+    3. missing_important_skills
+    4. experience_requirement_met
+    5. overall_match_percentage
+    6. final_verdict
 
     Keep the response concise and easy to read.
     """
@@ -175,11 +189,8 @@ def final_score(job,resume):
         "content" : prompt
     }
     messages=[message]
-    response_format={
-        "type": "json_object"
-    }
-    response = client.chat.completions.create(model=model, messages=messages, response_format=response_format)
-    data = json.loads(response.choices[0].message.content)
+    response = ask_ollama(messages, schema=match_schema)
+    data = json.loads(response)
     return MatchResult(**data)
 def parse_resume(resume_text):
     system_prompt = f"""
@@ -228,11 +239,7 @@ def parse_resume(resume_text):
         "content" : user_prompt
     }
     messages=[message_system, message_user]
-    response_format={
-        "type": "json_object"
-    }
-    response=client.chat.completions.create(model=model, messages=messages, response_format=response_format)
-    raw_output = response.choices[0].message.content
+    raw_output = ask_ollama(messages, schema=resume_schema)
     data = json.loads(raw_output)
     resume = Resume(**data)
     return resume
@@ -240,6 +247,7 @@ def parse_resume(resume_text):
 
 from pypdf import PdfReader
 from docx import Document
+
 def read_pdf(file_path):
     reader = PdfReader(file_path)
     text = ""
@@ -273,9 +281,52 @@ def read_resume(file_path):
         return None
 
 
+def make_short_text(value, width=35):
+    if isinstance(value, list):
+        value = ", ".join(str(item) for item in value)
+    elif isinstance(value, bool):
+        value = "Yes" if value else "No"
+    elif value is None:
+        value = ""
+    else:
+        value = str(value)
+    return shorten(value, width=width, placeholder="...")
+
+
+def print_results_table(results):
+    headers = ["Candidate", "Score", "Matching Skills", "Missing Skills", "Exp Met", "Verdict"]
+    rows = []
+
+    for result in results:
+        details = result["details"]
+        rows.append([
+            make_short_text(result["name"], 22),
+            f"{result['score']}%",
+            make_short_text(details.get("matching_skills"), 40),
+            make_short_text(details.get("missing_important_skills"), 45),
+            make_short_text(details.get("experience_requirement_met"), 8),
+            make_short_text(details.get("final_verdict"), 55),
+        ])
+
+    widths = [
+        max(len(str(row[index])) for row in [headers] + rows)
+        for index in range(len(headers))
+    ]
+
+    def print_row(row):
+        print("| " + " | ".join(str(cell).ljust(widths[index]) for index, cell in enumerate(row)) + " |")
+
+    separator = "|-" + "-|-".join("-" * width for width in widths) + "-|"
+    print("\nRESUME MATCH RESULTS")
+    print_row(headers)
+    print(separator)
+    for row in rows:
+        print_row(row)
+
+
 
 # lets do it now
-resume_folder = Path("resumes")
+resume_folder = Path(__file__).parent / "resumes"
 all_results=[]
 for file_path in resume_folder.iterdir():
     #C:\Users\Pratyush\padho_with_pratyush\week1\day5\resumes\abhay resume new - Abhay Singh.pdf
@@ -291,39 +342,17 @@ for file_path in resume_folder.iterdir():
     # request bhejna shhur krega millions
     #chattgot server jam ho jayega
     time.sleep(5)
-    print("Score:", result.score)
+    details = result.details
+    candidate_name = details.get("candidate_name") or parsed_resume.name
+
     all_results.append({
-        "name": parsed_resume.name,
+        "name": candidate_name,
         "score": result.score,
-        "details": result.details
+        "details": details
     })
+
 all_results.sort(
     key=lambda candidate: candidate["score"],
     reverse=True
 )
-top_2 = all_results[:2]
-worst_2 = all_results[-2:]
-
-
-print("TOP 2 CANDIDATES")
-for candidate in top_2:
-
-    print(
-        candidate["name"],
-        "-",
-        candidate["score"],
-        "%"
-    )
-
-    print(candidate["details"])
-
-print("LOWEST 2 CANDIDATES")
-for candidate in worst_2:
-
-    print(
-        candidate["name"],
-        "-",
-        candidate["score"],
-        "%"
-    )
-    print(candidate["details"])
+print_results_table(all_results)
