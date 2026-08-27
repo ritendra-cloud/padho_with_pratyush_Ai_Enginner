@@ -11,6 +11,7 @@
 """
 
 import json
+import sys
 from pathlib import Path
 
 import typer
@@ -52,6 +53,15 @@ from ytrag.transcribe import (
     transcribe,
     transcript_path,
 )
+
+# Windows consoles still default to cp1252, which cannot encode the box-drawing
+# and arrow characters rich uses — output crashes with UnicodeEncodeError partway
+# through a table. Force UTF-8 before anything prints.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 app = typer.Typer(add_completion=False, help="Timestamp-level RAG over a YouTube lecture playlist.")
 console = Console()
@@ -621,8 +631,8 @@ def preflight(playlist: str = typer.Option("", "--playlist", "-p", help="Also ch
     if playlist:
         check("playlist lists", lambda: f"{len(list_playlist(playlist))} videos")
 
-    console.print("\n[bold]LLM[/bold]")
-    check("groq responds", lambda: _probe_groq())
+    console.print("\n[bold]LLM (optional - search works without it)[/bold]")
+    check(f"{config.LLM_BACKEND} responds", _probe_llm)
 
     if ok:
         console.print("\n[bold green]All preflight checks passed.[/bold green]")
@@ -652,15 +662,59 @@ def _probe_run_whisper() -> str:
     return "reached faster-whisper cleanly"
 
 
-def _probe_groq() -> str:
-    from ytrag.answer import get_client as groq_client
+def _probe_llm() -> str:
+    """Exercise whichever backend is configured, not a hardcoded one."""
+    from ytrag.answer import _chat
 
-    response = groq_client().chat.completions.create(
-        model=config.LLM_MODEL,
-        messages=[{"role": "user", "content": "reply with: ok"}],
-        max_tokens=5,
+    if config.LLM_BACKEND == "none":
+        return "disabled (retrieval still works)"
+    reply = _chat("Reply with exactly: ok", "ok?")
+    return f"{config.LLM_BACKEND}: {reply.strip()[:12]}"
+
+
+def _bundled_vectors() -> Path | None:
+    """The prebuilt index committed to the repo, if there is one."""
+    f = Path(__file__).resolve().parent.parent / "index" / "vectors.npz"
+    return f if f.exists() else None
+
+
+@app.command()
+def export_vectors_cmd(
+    dest: Path = typer.Option(None, "--out", help="Defaults to ./index/vectors.npz"),
+):
+    """Save the built index so others can load it without embedding anything."""
+    from ytrag.index import export_vectors
+
+    target = dest or (Path(__file__).resolve().parent.parent / "index" / "vectors.npz")
+    info = export_vectors(target)
+    console.print(
+        f"Exported [bold]{info['count']}[/bold] vectors "
+        f"({info['mb']:.1f} MB) to {target}"
     )
-    return (response.choices[0].message.content or "").strip()[:12]
+    console.print("[dim]Commit this. Anyone who clones can then run `ytrag load`.[/dim]")
+
+
+@app.command()
+def load(
+    path: Path = typer.Option(None, "--path", help="Defaults to the repo's index/vectors.npz"),
+):
+    """Load the prebuilt index. Seconds, instead of minutes of embedding."""
+    from ytrag.index import import_vectors
+
+    source = path or _bundled_vectors()
+    if source is None:
+        console.print(
+            "[yellow]No prebuilt index found.[/yellow] Run `ytrag reindex` to build one."
+        )
+        raise typer.Exit(1)
+
+    console.print(f"Loading prebuilt index from {source} …")
+    info = import_vectors(source)
+    console.print(
+        f"[bold green]Loaded {info['count']} chunks[/bold green] "
+        f"(embedded with {info['model']})."
+    )
+    console.print("[dim]Now run `ytrag serve`.[/dim]")
 
 
 def _bundled_transcripts() -> Path | None:
@@ -746,7 +800,26 @@ def serve(
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-    console.print(f"[bold green]http://{host}:{port}[/bold green]")
+    # Check the port before loading a 90MB model and reporting "startup
+    # complete", only to fail on bind afterwards. uvicorn's own message arrives
+    # after the success line and reads like the app crashed for no reason.
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1)
+        if probe.connect_ex((host, port)) == 0:
+            console.print(
+                f"[bold red]Port {port} is already in use.[/bold red]\n"
+                f"Something is already listening on {host}:{port} — most likely "
+                f"another `ytrag serve` you started earlier.\n\n"
+                f"Either stop that one (Ctrl-C in its window), or use another "
+                f"port here:\n  [cyan]uv run ytrag serve --port {port + 1}[/cyan]\n\n"
+                f"[dim]To find it on Windows:  netstat -ano | findstr :{port}[/dim]"
+            )
+            raise typer.Exit(1)
+
+    console.print("[dim]Starting… the embedding model loads first (a few seconds).[/dim]")
+    console.print(f"[bold green]http://{host}:{port}[/bold green]  [dim](Ctrl-C to stop)[/dim]")
 
     if reload:
         # --reload needs an import string, and the reloader spawns a fresh

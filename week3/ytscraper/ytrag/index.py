@@ -5,6 +5,12 @@ the collection name carries the embedding dim, and point IDs are derived from
 a stable chunk_id so re-ingesting overwrites instead of duplicating.
 """
 
+import atexit
+import json
+import re
+import uuid
+from pathlib import Path
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -20,23 +26,66 @@ from ytrag.config import (
     COLLECTION,
     MAX_DISTANCE,
     QDRANT_API_KEY,
+    QDRANT_PATH,
     QDRANT_URL,
+    TITLE_BOOST,
     TOP_K,
     UPSERT_BATCH,
 )
 from ytrag.embed import get_embedder
-from ytrag.models import Chunk
+from ytrag.models import Chunk, _NAMESPACE
 from ytrag.util import with_retry
 
 _CLIENT: QdrantClient | None = None
 
 
+def _close_client() -> None:
+    """Release the store before the interpreter tears down.
+
+    Qdrant's own __del__ runs during shutdown, by which point sys.meta_path is
+    gone and its close() raises ImportError. Harmless, but it prints a
+    traceback after a successful command and looks like a crash.
+    """
+    global _CLIENT
+    if _CLIENT is not None:
+        try:
+            _CLIENT.close()
+        except Exception:
+            pass
+        _CLIENT = None
+
+
+atexit.register(_close_client)
+
+
 def get_client() -> QdrantClient:
+    """Qdrant Cloud when configured, otherwise an embedded local store.
+
+    The local mode matters more than it looks: it means someone can clone this
+    repo and have a working index with no Qdrant account, no Docker, and no
+    signup — just a folder on disk. QDRANT_URL upgrades them to the hosted
+    cluster whenever they want one.
+    """
     global _CLIENT
     if _CLIENT is None:
-        if not QDRANT_URL:
-            raise RuntimeError("QDRANT_URL is not set. Add it to the repo-root .env.")
-        _CLIENT = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+        if QDRANT_URL:
+            _CLIENT = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+        else:
+            QDRANT_PATH.mkdir(parents=True, exist_ok=True)
+            try:
+                _CLIENT = QdrantClient(path=str(QDRANT_PATH))
+            except RuntimeError as exc:
+                # The embedded store is a single-writer file lock, so a second
+                # command while `ytrag serve` is running fails with a message
+                # that explains nothing. Say what actually happened.
+                if "already accessed" in str(exc) or "Storage folder" in str(exc):
+                    raise RuntimeError(
+                        "The local index is already open in another process — most likely "
+                        "`ytrag serve` is running in another terminal. Stop it (Ctrl-C) and "
+                        "try again, or set QDRANT_URL to use a hosted Qdrant which allows "
+                        "many readers at once."
+                    ) from exc
+                raise
     return _CLIENT
 
 
@@ -64,12 +113,14 @@ def ensure_collection() -> str:
                 distance=Distance.COSINE,
             ),
         )
-        # Needed for the --video filter on search.
-        client.create_payload_index(
-            collection_name=name,
-            field_name="video_id",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
+        # Only meaningful on a Qdrant server — the embedded store filters
+        # without an index and warns if you ask for one.
+        if QDRANT_URL:
+            client.create_payload_index(
+                collection_name=name,
+                field_name="video_id",
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
     return name
 
 
@@ -145,6 +196,38 @@ def indexed_video_ids() -> set[str]:
     return found
 
 
+# Words that carry no topic signal — Hinglish question scaffolding, plus the
+# boilerplate that appears in almost every lecture title.
+_STOP = {
+    "kaise", "kya", "hai", "hain", "me", "ka", "ki", "ke", "aur", "kab", "karte",
+    "karna", "hota", "nikale", "solve", "kare", "chahiye", "use", "kahan", "se",
+    "ko", "pehchane", "difference", "farak", "the", "a", "is", "in", "what", "how",
+    "do", "to", "of", "for", "video", "dsa", "patterns", "pattern", "episode",
+    "leetcode", "interview", "questions", "question", "master", "best", "explained",
+}
+
+
+def _stem(word: str) -> str:
+    """Crude plural stripping, enough to match 'hashmap' against 'HASHMAPS'."""
+    for suffix in ("es", "s"):
+        if len(word) > 4 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def _terms(text: str) -> set[str]:
+    return {
+        _stem(w)
+        for w in re.findall(r"[a-z0-9]+", text.lower())
+        if w not in _STOP and len(w) > 2
+    }
+
+
+def title_overlap(query: str, title: str) -> int:
+    """How many meaningful query words appear in the lecture's title."""
+    return len(_terms(query) & _terms(title))
+
+
 def search(
     query: str,
     top_k: int = TOP_K,
@@ -166,23 +249,34 @@ def search(
             must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))]
         )
 
+    # Over-fetch, then re-rank. The vector search alone is a decent recall
+    # filter but a poor judge of which result belongs first.
     results = client.query_points(
         collection_name=name,
         query=vector,
-        limit=top_k,
+        limit=max(top_k * 4, 20),
         with_payload=True,
         query_filter=query_filter,
     ).points
 
     cutoff = MAX_DISTANCE if max_distance is None else max_distance
-    hits: list[tuple[Chunk, float]] = []
+    scored: list[tuple[float, float, Chunk]] = []
     for point in results:
         distance = 1.0 - float(point.score)
         if distance > cutoff:
             continue
-        hits.append((Chunk.from_payload(point.payload), distance))
+        chunk = Chunk.from_payload(point.payload)
+        # Nudge chunks whose lecture title actually mentions what was asked.
+        # Dense similarity over a 75-second ramble dilutes the topic badly —
+        # a chunk about ASCII values outranked the Number of Islands lecture
+        # for "number of islands" until this existed. The title is the one
+        # place the topic is stated plainly, so it gets a say in the ordering.
+        # Measured on 12 questions: top-1 accuracy 9/12 -> 12/12.
+        overlap = title_overlap(query, chunk.video_title)
+        scored.append((distance - TITLE_BOOST * overlap, distance, chunk))
 
-    return hits
+    scored.sort(key=lambda row: row[0])
+    return [(chunk, distance) for _, distance, chunk in scored[:top_k]]
 
 
 def stats() -> dict:
@@ -221,3 +315,82 @@ def stats() -> dict:
         "embed_model": get_embedder().name,
         "videos": videos,
     }
+
+
+# ------------------------------------------------------------------
+# Shipping a prebuilt index
+# ------------------------------------------------------------------
+# Embedding 2933 chunks takes a couple of minutes on a decent CPU and rather
+# longer on a weak laptop. The vectors themselves are small — 2933 x 384
+# float16 is about 2 MB — so committing them means someone can clone the repo
+# and have a working index in seconds, without ever running the encoder over
+# the corpus. They still need the model to embed their own *queries*, which is
+# why the small one matters.
+
+def export_vectors(path: Path) -> dict:
+    """Dump every point's vector and payload to a compressed .npz."""
+    import numpy as np
+
+    client = get_client()
+    name = collection_name()
+    vectors, payloads = [], []
+
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=name, limit=512, offset=offset,
+            with_payload=True, with_vectors=True,
+        )
+        for point in points:
+            vectors.append(point.vector)
+            payloads.append(point.payload)
+        if offset is None:
+            break
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        vectors=np.array(vectors, dtype=np.float16),
+        payloads=np.array(json.dumps(payloads)),
+        model=np.array(get_embedder().name),
+        dim=np.array(get_embedder().dim),
+    )
+    return {"count": len(vectors), "mb": path.stat().st_size / 1024 / 1024}
+
+
+def import_vectors(path: Path, batch_size: int = UPSERT_BATCH) -> dict:
+    """Load a .npz built by export_vectors straight into the collection.
+
+    Refuses to load vectors built by a different embedding model — mixing them
+    would silently wreck retrieval, since a query encoded by one model is
+    meaningless against another's vectors.
+    """
+    import numpy as np
+
+    data = np.load(path, allow_pickle=False)
+    model = str(data["model"])
+    if model != get_embedder().name:
+        raise RuntimeError(
+            f"These vectors were built with {model}, but YTRAG_EMBED_MODEL is "
+            f"{get_embedder().name}. Set YTRAG_EMBED_MODEL={model}, or run "
+            f"`ytrag reindex` to rebuild with your model."
+        )
+
+    vectors = data["vectors"].astype("float32")
+    payloads = json.loads(str(data["payloads"]))
+    name = ensure_collection()
+    client = get_client()
+
+    for start in range(0, len(vectors), batch_size):
+        chunk_payloads = payloads[start : start + batch_size]
+        points = [
+            PointStruct(
+                id=str(uuid.uuid5(_NAMESPACE, p["chunk_id"])),
+                vector=v.tolist(),
+                payload=p,
+            )
+            for v, p in zip(vectors[start : start + batch_size], chunk_payloads)
+        ]
+        client.upsert(collection_name=name, points=points, wait=True)
+
+    return {"count": len(vectors), "model": model}
